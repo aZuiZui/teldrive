@@ -307,6 +307,10 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 
 	// Use transaction to ensure file creation and upload cleanup are atomic
 	err = a.db.Transaction(func(tx *gorm.DB) error {
+		if err := retireReplacedParts(tx, &fileDB); err != nil {
+			return err
+		}
+
 		//For some reason, gorm conflict clauses are not working with partial index so using raw query
 		if err := tx.Raw(`
 			INSERT INTO teldrive.files (
@@ -396,15 +400,16 @@ func (a *apiService) deleteFilesBulk(db *gorm.DB, fileIds []string, userId int64
 		SELECT id FROM teldrive.files WHERE id IN (?) AND user_id = ?
 		UNION ALL
 		SELECT f.id FROM teldrive.files f JOIN target_folders tf ON f.parent_id = tf.id
+		WHERE f.user_id = ?
 	),
 	mark_deleted AS (
 		UPDATE teldrive.files SET status = 'pending_deletion'
 		WHERE (parent_id IN (SELECT id FROM target_folders) OR id IN (?))
-		AND type = 'file'
+		AND type = 'file' AND user_id = ?
 	)
 	DELETE FROM teldrive.files WHERE id IN (SELECT id FROM target_folders) AND type = 'folder';
 	`
-	return db.Exec(query, fileIds, userId, fileIds).Error
+	return db.Exec(query, fileIds, userId, userId, fileIds, userId).Error
 }
 
 func (a *apiService) getFullPath(db *gorm.DB, fileID string) (string, error) {
@@ -1025,6 +1030,63 @@ func (a *apiService) FilesStream(ctx context.Context, params api.FilesStreamPara
 
 func (a *apiService) SharesStream(ctx context.Context, params api.SharesStreamParams) (api.SharesStreamRes, error) {
 	return nil, nil
+}
+
+// retireReplacedParts keeps Telegram messages from being orphaned when a create
+// overwrites an existing active file of the same name. The upsert replaces the
+// parts column in place, so the old part ids would otherwise be lost; instead
+// they are moved to a pending_deletion row that the clean-files cron job removes.
+// Parts reused by the new file are kept.
+func retireReplacedParts(tx *gorm.DB, fileDB *models.File) error {
+	// Serialize creates of the same name so each one sees the parts it replaces.
+	parentID := ""
+	if fileDB.ParentId != nil {
+		parentID = *fileDB.ParentId
+	}
+	lockKey := fmt.Sprintf("%d/%s/%s", fileDB.UserId, parentID, fileDB.Name)
+	if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", lockKey).Error; err != nil {
+		return err
+	}
+
+	var existing models.File
+	if err := tx.Where("name = ? AND user_id = ? AND status = 'active'", fileDB.Name, fileDB.UserId).
+		Where("parent_id IS NOT DISTINCT FROM ?", fileDB.ParentId).
+		Limit(1).Find(&existing).Error; err != nil {
+		return err
+	}
+	if existing.ID == "" || existing.Type != "file" || existing.Parts == nil {
+		return nil
+	}
+
+	kept := map[int]bool{}
+	if fileDB.Parts != nil {
+		for _, part := range *fileDB.Parts {
+			kept[part.ID] = true
+		}
+	}
+	var stale []api.Part
+	for _, part := range *existing.Parts {
+		if !kept[part.ID] {
+			stale = append(stale, part)
+		}
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+
+	// The copy keeps the old channel, which is where the stale messages live.
+	return tx.Create(&models.File{
+		Name:      existing.Name,
+		Type:      existing.Type,
+		MimeType:  existing.MimeType,
+		Size:      existing.Size,
+		UserId:    existing.UserId,
+		ParentId:  existing.ParentId,
+		ChannelId: existing.ChannelId,
+		Parts:     utils.Ptr(datatypes.NewJSONSlice(stale)),
+		Status:    "pending_deletion",
+		UpdatedAt: utils.Ptr(time.Now().UTC()),
+	}).Error
 }
 
 func mapParts(_parts []api.Part) []api.Part {
