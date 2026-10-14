@@ -72,6 +72,14 @@ type CheckCmdConfig struct {
 	CleanPending bool          `default:"false" description:"Clean files with pending_deletion status"`
 }
 
+type ProbeCmdConfig struct {
+	Log      LoggingConfig `skipPflag:"true"`
+	DB       DBConfig      `skipPflag:"true"`
+	TG       TGConfig      `skipPflag:"true"`
+	Timeout  time.Duration `default:"30s" description:"Timeout for each Telegram read"`
+	Attempts int           `default:"3" description:"Reads at each spot before a part counts as unreadable"`
+}
+
 type ServerConfig struct {
 	Port             int           `default:"8080" description:"HTTP port for the server to listen on"`
 	GracefulShutdown time.Duration `default:"10s" description:"Grace period for server shutdown"`
