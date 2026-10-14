@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -34,6 +35,8 @@ type apiService struct {
 	botSelector    tgc.BotSelector
 	events         events.EventBroadcaster
 	channelManager *tgc.ChannelManager
+	streamPool     *tgc.StreamPool // warm streaming bot clients (tg.stream.warm-clients)
+	streamBots     atomic.Int64    // bots streaming can use (decides the flood-wait limit of a new client)
 }
 
 func (a *apiService) newMiddlewares(ctx context.Context, retries int) []telegram.Middleware {
@@ -202,7 +205,7 @@ func NewApiService(db *gorm.DB,
 	botSelector tgc.BotSelector,
 	events events.EventBroadcaster) *apiService {
 
-	return &apiService{
+	a := &apiService{
 		db:             db,
 		cnf:            cnf,
 		cache:          cache,
@@ -210,6 +213,26 @@ func NewApiService(db *gorm.DB,
 		events:         events,
 		channelManager: tgc.NewChannelManager(db, cache, &cnf.TG),
 	}
+	a.streamPool = tgc.NewStreamPool(a.runStreamClient, cnf.TG.Stream.WarmIdle)
+	return a
+}
+
+// runStreamClient runs one bot's warm streaming client for the pool: logged in once, then kept
+// connected (with its DC connections) until the pool closes it. ctx is the pool's, not a
+// request's, so the middlewares (recovery, flood-wait standby) outlive every request.
+func (a *apiService) runStreamClient(ctx context.Context, token string, ready func(*telegram.Client)) error {
+	client, err := tgc.BotClient(ctx, a.db, a.cache, &a.cnf.TG, token, a.streamMiddlewares(ctx, token, int(a.streamBots.Load()))...)
+	if err != nil {
+		return err
+	}
+	return client.Run(ctx, func(ctx context.Context) error {
+		if err := tgc.Auth(ctx, client, token); err != nil {
+			return err
+		}
+		ready(client)
+		<-ctx.Done()
+		return ctx.Err()
+	})
 }
 
 type extendedService struct {

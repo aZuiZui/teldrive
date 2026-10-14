@@ -170,6 +170,8 @@ type TGStream struct {
 	RefusedPartTTL time.Duration `default:"10m" description:"How long a part Telegram refused (-503) fails at once instead of being asked for again (0: off)"`
 	BotsLimit      int           `default:"0" description:"Maximum number of bots for streaming (0 = use all bots)"`
 	MaxFloodWait   time.Duration `default:"5s" description:"Longest flood wait to sit out while streaming; a longer wait puts the bot on standby for that long and the request is retried on another bot (0 = always wait)"`
+	WarmClients    bool          `default:"true" description:"Keep each streaming bot's client running between requests (it logs in to a file's DC once instead of on every request); false: a new client per request"`
+	WarmIdle       time.Duration `default:"30m" description:"Close a warm streaming client after it has been unused this long"`
 }
 
 type TGUpload struct {
