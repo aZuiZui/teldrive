@@ -260,7 +260,7 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 					return nil, &apiError{err: errors.New("invalid part: part_id cannot be zero"), code: 400}
 				}
 			}
-			
+
 			// Convert uploads to parts
 			for _, upload := range uploads {
 				parts = append(parts, api.Part{
@@ -946,8 +946,9 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	}
 
 	var (
-		client *telegram.Client
-		token  string
+		client  *telegram.Client
+		token   string
+		release func() // set for a warm (pooled) client: already running and logged in
 	)
 
 	if len(tokens) == 0 {
@@ -963,10 +964,20 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			fail("stream.bot_selection_failed", http.StatusInternalServerError, err)
 			return
 		}
-		client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, e.api.streamMiddlewares(ctx, token, len(tokens))...)
-		if err != nil {
-			fail("stream.bot_client_failed", http.StatusInternalServerError, err)
-			return
+		if e.api.cnf.TG.Stream.WarmClients {
+			e.api.streamBots.Store(int64(len(tokens)))
+			client, release, err = e.api.streamPool.Acquire(ctx, token)
+			if err != nil {
+				fail("stream.bot_client_failed", http.StatusBadGateway, err)
+				return
+			}
+			defer release()
+		} else {
+			client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, e.api.streamMiddlewares(ctx, token, len(tokens))...)
+			if err != nil {
+				fail("stream.bot_client_failed", http.StatusInternalServerError, err)
+				return
+			}
 		}
 	}
 
@@ -1018,6 +1029,12 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		return nil
 	}
 
+	if release != nil {
+		if err := handleStream(ctx); err != nil {
+			fail("stream.client_failed", http.StatusBadGateway, err)
+		}
+		return
+	}
 	if err := tgc.RunWithAuth(ctx, client, token, handleStream); err != nil {
 		fail("stream.client_failed", http.StatusBadGateway, err)
 	}
