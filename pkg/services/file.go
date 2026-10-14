@@ -921,6 +921,10 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	// 206 with an error text as its body, which rclone took for file data and retried.
 	headersSent := false
 	fail := func(event string, code int, err error) {
+		if ctx.Err() != nil {
+			// The client went away (rclone cancels reads when seeking): not the file's fault.
+			return
+		}
 		logger.Error(event, zap.String("file_name", file.Name), zap.Error(err))
 		if headersSent {
 			return
@@ -1002,9 +1006,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 
 		body := bufio.NewReaderSize(lr, 64*1024)
 		if _, err := body.Peek(1); err != nil && !errors.Is(err, io.EOF) {
-			if ctx.Err() == nil {
-				fail("stream.unreadable", http.StatusBadGateway, err)
-			}
+			fail("stream.unreadable", http.StatusBadGateway, err)
 			return nil
 		}
 
@@ -1016,7 +1018,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		return nil
 	}
 
-	if err := tgc.RunWithAuth(ctx, client, token, handleStream); err != nil && ctx.Err() == nil {
+	if err := tgc.RunWithAuth(ctx, client, token, handleStream); err != nil {
 		fail("stream.client_failed", http.StatusBadGateway, err)
 	}
 }
