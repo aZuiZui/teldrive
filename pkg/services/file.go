@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -819,6 +820,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			user, err = auth.VerifyUser(ctx, e.api.db, e.api.cache, e.api.cnf.JWT.Secret, cookie.Value)
 			if err != nil {
 				http.Error(w, "invalid token", http.StatusUnauthorized)
+				return
 			}
 			userId, _ := strconv.ParseInt(user.Subject, 10, 64)
 			session = &models.Session{UserId: userId, Session: user.TgSession}
@@ -909,17 +911,28 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 
 	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": file.Name}))
 
-	w.WriteHeader(status)
-
 	if r.Method == http.MethodHead {
+		w.WriteHeader(status)
 		return
+	}
+
+	// The status line goes out only once Telegram has given the first bytes. A file it
+	// refuses (e.g. -503 Timeout on one part) then gets a 502 with the reason instead of a
+	// 206 with an error text as its body, which rclone took for file data and retried.
+	headersSent := false
+	fail := func(event string, code int, err error) {
+		logger.Error(event, zap.String("file_name", file.Name), zap.Error(err))
+		if headersSent {
+			return
+		}
+		headersSent = true
+		streamError(w, code, err)
 	}
 
 	tokens, err := e.api.channelManager.BotTokens(ctx, session.UserId)
 
 	if err != nil {
-		logger.Error("stream.bots_fetch_failed", zap.Error(err))
-		http.Error(w, "failed to get bots", http.StatusInternalServerError)
+		fail("stream.bots_fetch_failed", http.StatusInternalServerError, fmt.Errorf("failed to get bots: %w", err))
 		return
 	}
 
@@ -929,7 +942,6 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	}
 
 	var (
-		lr     io.ReadCloser
 		client *telegram.Client
 		token  string
 	)
@@ -937,22 +949,19 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	if len(tokens) == 0 {
 		client, err = tgc.AuthClient(ctx, &e.api.cnf.TG, session.Session, e.api.newMiddlewares(ctx, 5)...)
 		if err != nil {
-			logger.Error("stream.auth_client_failed", zap.Error(err))
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			fail("stream.auth_client_failed", http.StatusInternalServerError, err)
 			return
 		}
 
 	} else {
 		token, _, err = e.api.botSelector.Next(ctx, tgc.BotOpStream, session.UserId, tokens)
 		if err != nil {
-			logger.Error("stream.bot_selection_failed", zap.Error(err))
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			fail("stream.bot_selection_failed", http.StatusInternalServerError, err)
 			return
 		}
 		client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, e.api.streamMiddlewares(ctx, token, len(tokens))...)
 		if err != nil {
-			logger.Error("stream.bot_client_failed", zap.Error(err))
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			fail("stream.bot_client_failed", http.StatusInternalServerError, err)
 			return
 		}
 	}
@@ -965,49 +974,60 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		}
 	}
 
-	if r.Method != http.MethodHead {
-		handleStream := func() error {
-			parts, err := getParts(ctx, client, e.api.cache, file)
-			if err != nil {
-				logger.Error("stream.parts_fetch_failed", zap.Error(err))
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return nil
-			}
+	handleStream := func(ctx context.Context) error {
+		parts, err := getParts(ctx, client, e.api.cache, file)
+		if err != nil {
+			fail("stream.parts_fetch_failed", http.StatusBadGateway, err)
+			return nil
+		}
 
-			lr, err = reader.NewReader(ctx,
-				client.API(),
-				e.api.cache,
-				file,
-				parts,
-				start,
-				end,
-				&e.api.cnf.TG,
-				botID,
-			)
+		lr, err := reader.NewReader(ctx,
+			client.API(),
+			e.api.cache,
+			file,
+			parts,
+			start,
+			end,
+			&e.api.cnf.TG,
+			botID,
+		)
+		if err == nil && lr == nil {
+			err = errors.New("failed to initialise reader")
+		}
+		if err != nil {
+			fail("stream.unreadable", http.StatusBadGateway, err)
+			return nil
+		}
+		defer lr.Close()
 
-			if err != nil {
-				logger.Error("stream.reader_create_failed", zap.Error(err))
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return nil
-			}
-			if lr == nil {
-				logger.Error("stream.reader_nil")
-				http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
-				return nil
-			}
-
-			_, err = io.CopyN(w, lr, contentLength)
-			if err != nil {
-				lr.Close()
+		body := bufio.NewReaderSize(lr, 64*1024)
+		if _, err := body.Peek(1); err != nil && !errors.Is(err, io.EOF) {
+			if ctx.Err() == nil {
+				fail("stream.unreadable", http.StatusBadGateway, err)
 			}
 			return nil
 		}
 
-		tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
-			return handleStream()
-		})
-
+		headersSent = true
+		w.WriteHeader(status)
+		if _, err := io.CopyN(w, body, contentLength); err != nil && ctx.Err() == nil {
+			logger.Error("stream.read_failed", zap.String("file_name", file.Name), zap.Error(err))
+		}
+		return nil
 	}
+
+	if err := tgc.RunWithAuth(ctx, client, token, handleStream); err != nil && ctx.Err() == nil {
+		fail("stream.client_failed", http.StatusBadGateway, err)
+	}
+}
+
+// streamError answers a stream request that failed before any of the file was sent: the
+// headers set for the file (length, range, ...) would describe a body that isn't coming.
+func streamError(w http.ResponseWriter, code int, err error) {
+	for _, h := range []string{"Content-Range", "Content-Length", "Content-Disposition", "ETag", "Last-Modified", "Accept-Ranges"} {
+		w.Header().Del(h)
+	}
+	http.Error(w, err.Error(), code)
 }
 
 func (e *extendedService) SharesStream(w http.ResponseWriter, r *http.Request, shareId, fileId string) {

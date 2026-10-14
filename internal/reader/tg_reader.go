@@ -79,6 +79,8 @@ type tgMultiReader struct {
 	timeout     time.Duration
 	logger      *zap.Logger
 	closeOnce   sync.Once
+	errMu       sync.Mutex
+	err         error // why filling stopped, returned by Read instead of a bare cancel
 }
 
 func newTGMultiReader(
@@ -129,10 +131,16 @@ func (r *tgMultiReader) Read(p []byte) (int, error) {
 		select {
 		case cur, ok := <-r.bufferChan:
 			if !ok {
+				if err := r.fillErr(); err != nil {
+					return 0, err
+				}
 				return 0, ErrStreamAbandoned
 			}
 			r.cur = cur
 		case <-r.ctx.Done():
+			if err := r.fillErr(); err != nil {
+				return 0, err
+			}
 			return 0, r.ctx.Err()
 		}
 	}
@@ -153,10 +161,21 @@ func (r *tgMultiReader) fillBuffer() {
 
 	for r.currentPart < r.totalParts {
 		if err := r.fillBatch(); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				r.errMu.Lock()
+				r.err = err
+				r.errMu.Unlock()
+			}
 			r.cancel()
 			return
 		}
 	}
+}
+
+func (r *tgMultiReader) fillErr() error {
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
+	return r.err
 }
 
 func (r *tgMultiReader) fillBatch() error {
@@ -193,7 +212,8 @@ func (r *tgMultiReader) fillBatch() error {
 
 	if err := g.Wait(); err != nil {
 		if !errors.Is(err, context.Canceled) {
-			r.logger.Error("stream.chunk_failed", zap.Error(err), zap.Int("part", r.currentPart), zap.Int("total_parts", r.totalParts))
+			r.logger.Error("stream.chunk_failed", zap.Error(err), zap.Int("chunk", r.currentPart), zap.Int("total_chunks", r.totalParts),
+				zap.Int64("offset", r.offset))
 		}
 
 		return err
