@@ -174,6 +174,7 @@ func (r *Reader) getPartReader() (io.ReadCloser, error) {
 		concurrency: r.concurrency,
 		cache:       r.cache,
 		key:         cache.KeyFileLocation(r.config.SessionInstance, r.botID, r.file.ID, partId),
+		refusedTTL:  r.config.Stream.RefusedPartTTL,
 	}
 
 	var (

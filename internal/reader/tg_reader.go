@@ -35,6 +35,7 @@ type chunkSource struct {
 	client      *tg.Client
 	key         string
 	cache       cache.Cacher
+	refusedTTL  time.Duration // how long a part Telegram refused fails at once (0: never)
 }
 
 func (c *chunkSource) ChunkSize(start, end int64) int64 {
@@ -42,6 +43,20 @@ func (c *chunkSource) ChunkSize(start, end int64) int64 {
 }
 
 func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]byte, error) {
+	refusedAt := refusedKey(c.channelId, c.partId)
+	if err := refused.check(refusedAt); err != nil {
+		return nil, err
+	}
+	chunk, err := c.fetch(ctx, offset, limit)
+	if err != nil {
+		refused.remember(refusedAt, err, c.refusedTTL)
+		return nil, err
+	}
+	refused.forget(refusedAt)
+	return chunk, nil
+}
+
+func (c *chunkSource) fetch(ctx context.Context, offset int64, limit int64) ([]byte, error) {
 	var (
 		location tg.InputDocumentFileLocation
 		err      error

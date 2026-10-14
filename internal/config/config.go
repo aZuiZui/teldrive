@@ -164,11 +164,12 @@ type CronJobConfig struct {
 }
 
 type TGStream struct {
-	Concurrency  int           `default:"1" description:"Number of concurrent threads for concurrent reader"`
-	Buffers      int           `default:"8" description:"Number of stream buffers"`
-	ChunkTimeout time.Duration `default:"30s" description:"Chunk download timeout"`
-	BotsLimit    int           `default:"0" description:"Maximum number of bots for streaming (0 = use all bots)"`
-	MaxFloodWait time.Duration `default:"5s" description:"Longest flood wait to sit out while streaming; a longer wait puts the bot on standby for that long and the request is retried on another bot (0 = always wait)"`
+	Concurrency    int           `default:"1" description:"Number of concurrent threads for concurrent reader"`
+	Buffers        int           `default:"8" description:"Number of stream buffers"`
+	ChunkTimeout   time.Duration `default:"30s" description:"Chunk download timeout"`
+	RefusedPartTTL time.Duration `default:"10m" description:"How long a part Telegram refused (-503) fails at once instead of being asked for again (0: off)"`
+	BotsLimit      int           `default:"0" description:"Maximum number of bots for streaming (0 = use all bots)"`
+	MaxFloodWait   time.Duration `default:"5s" description:"Longest flood wait to sit out while streaming; a longer wait puts the bot on standby for that long and the request is retried on another bot (0 = always wait)"`
 }
 
 type TGUpload struct {
