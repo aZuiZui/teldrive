@@ -207,7 +207,22 @@ func GetBotInfo(ctx context.Context, db *gorm.DB, cache cache.Cacher, config *co
 	return &types.BotInfo{Id: user.ID, UserName: user.Username, Token: token}, nil
 }
 
+// FileLocation is a part's file location and the DC that stores it (0: not known).
+type FileLocation struct {
+	Location tg.InputDocumentFileLocation
+	DC       int
+}
+
 func GetLocation(ctx context.Context, client *tg.Client, channelId int64, partId int64) (location *tg.InputDocumentFileLocation, err error) {
+	loc, err := GetFileLocation(ctx, client, channelId, partId)
+	if err != nil {
+		return nil, err
+	}
+	return &loc.Location, nil
+}
+
+func GetFileLocation(ctx context.Context, client *tg.Client, channelId int64, partId int64) (*FileLocation, error) {
+	var location *FileLocation
 
 	channel, err := GetChannelById(ctx, client, channelId)
 
@@ -236,8 +251,11 @@ func GetLocation(ctx context.Context, client *tg.Client, channelId int64, partId
 	case *tg.Message:
 		media := item.Media.(*tg.MessageMediaDocument)
 		document := media.Document.(*tg.Document)
-		location = document.AsInputDocumentFileLocation()
+		location = &FileLocation{Location: *document.AsInputDocumentFileLocation(), DC: document.DCID}
 
+	}
+	if location == nil {
+		return nil, errors.New("no document found")
 	}
 
 	return location, nil

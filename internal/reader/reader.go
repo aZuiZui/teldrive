@@ -45,6 +45,7 @@ type Reader struct {
 	remaining   int64
 	config      *config.TGConfig
 	client      *tg.Client
+	dcAPI       DCAPI
 	concurrency int
 	cache       cache.Cacher
 	closeOnce   sync.Once
@@ -78,6 +79,7 @@ func NewReader(ctx context.Context,
 	end int64,
 	config *config.TGConfig,
 	botID string,
+	dcAPI DCAPI, // nil: every read goes through client
 ) (io.ReadCloser, error) {
 
 	size := parts[0].Size
@@ -92,6 +94,7 @@ func NewReader(ctx context.Context,
 		ranges:    calculatePartByteRanges(start, end, size),
 		config:    config,
 		client:    client,
+		dcAPI:     dcAPI,
 		cache:     cache,
 		botID:     botID,
 	}
@@ -171,6 +174,7 @@ func (r *Reader) getPartReader() (io.ReadCloser, error) {
 		channelId:   *r.file.ChannelId,
 		partId:      partId,
 		client:      r.client,
+		dcAPI:       r.dcAPI,
 		concurrency: r.concurrency,
 		cache:       r.cache,
 		key:         cache.KeyFileLocation(r.config.SessionInstance, r.botID, r.file.ID, partId),

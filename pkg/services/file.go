@@ -949,6 +949,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		client  *telegram.Client
 		token   string
 		release func() // set for a warm (pooled) client: already running and logged in
+		dcAPI   reader.DCAPI
 	)
 
 	if len(tokens) == 0 {
@@ -966,12 +967,14 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		}
 		if e.api.cnf.TG.Stream.WarmClients {
 			e.api.streamBots.Store(int64(len(tokens)))
-			client, release, err = e.api.streamPool.Acquire(ctx, token)
+			var warm *tgc.WarmClient
+			warm, release, err = e.api.streamPool.Acquire(ctx, token)
 			if err != nil {
 				fail("stream.bot_client_failed", http.StatusBadGateway, err)
 				return
 			}
 			defer release()
+			client, dcAPI = warm.Client, warm.DCAPI
 		} else {
 			client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, e.api.streamMiddlewares(ctx, token, len(tokens))...)
 			if err != nil {
@@ -1005,6 +1008,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			end,
 			&e.api.cnf.TG,
 			botID,
+			dcAPI,
 		)
 		if err == nil && lr == nil {
 			err = errors.New("failed to initialise reader")

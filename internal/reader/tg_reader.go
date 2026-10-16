@@ -23,6 +23,9 @@ var (
 	ErrChunkTimeout    = errors.New("chunk fetch timed out")
 )
 
+// DCAPI returns the client to read a file stored on dc with.
+type DCAPI func(ctx context.Context, dc int) (*tg.Client, error)
+
 type ChunkSource interface {
 	Chunk(ctx context.Context, offset int64, limit int64) ([]byte, error)
 	ChunkSize(start, end int64) int64
@@ -33,6 +36,7 @@ type chunkSource struct {
 	partId      int64
 	concurrency int
 	client      *tg.Client
+	dcAPI       DCAPI // set for a warm client: reads go to the part's DC over several connections
 	key         string
 	cache       cache.Cacher
 	refusedTTL  time.Duration // how long a part Telegram refused fails at once (0: never)
@@ -57,15 +61,11 @@ func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]b
 }
 
 func (c *chunkSource) fetch(ctx context.Context, offset int64, limit int64) ([]byte, error) {
-	var (
-		location tg.InputDocumentFileLocation
-		err      error
-	)
+	var location tgc.FileLocation
 
-	err = c.cache.Get(ctx, c.key, &location)
-
-	if err != nil {
-		loc, err := tgc.GetLocation(ctx, c.client, c.channelId, c.partId)
+	// An entry cached before the DC was stored decodes without a location: fetch it again.
+	if err := c.cache.Get(ctx, c.key, &location); err != nil || location.Location.ID == 0 {
+		loc, err := tgc.GetFileLocation(ctx, c.client, c.channelId, c.partId)
 		if err != nil {
 			return nil, err
 		}
@@ -73,7 +73,14 @@ func (c *chunkSource) fetch(ctx context.Context, offset int64, limit int64) ([]b
 		location = *loc
 	}
 
-	return tgc.GetChunk(ctx, c.client, &location, offset, limit)
+	client := c.client
+	if c.dcAPI != nil {
+		var err error
+		if client, err = c.dcAPI(ctx, location.DC); err != nil {
+			return nil, err
+		}
+	}
+	return tgc.GetChunk(ctx, client, &location.Location, offset, limit)
 
 }
 
