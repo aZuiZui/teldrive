@@ -10,13 +10,14 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"github.com/tgdrive/teldrive/internal/logging"
 	"go.uber.org/zap"
 )
 
 const (
 	dcPoolOpenTimeout = 30 * time.Second // logging in to a DC (export/import authorization)
-	dcPoolRetryAfter  = 30 * time.Second // after a DC failed to open, use the fallback this long
+	dcPoolRetryAfter  = 30 * time.Second // after a DC failed to open, use the fallback this long (or the flood wait)
 )
 
 var errDCPoolsClosed = errors.New("dc pools closed")
@@ -48,11 +49,11 @@ type DCPools struct {
 }
 
 type dcPool struct {
-	ready    chan struct{} // closed once api or err is set
-	api      *tg.Client
-	inv      telegram.CloseInvoker
-	err      error
-	failedAt time.Time
+	ready   chan struct{} // closed once api or err is set
+	api     *tg.Client
+	inv     telegram.CloseInvoker
+	err     error
+	retryAt time.Time // after a failed open: when to try the DC again
 }
 
 // NewDCPools returns the DC pools of a running, logged-in client. ctx is the client's run
@@ -88,7 +89,7 @@ func (p *DCPools) API(ctx context.Context, dc int) (*tg.Client, error) {
 		return p.fallback, nil
 	}
 	e := p.dcs[dc]
-	if e != nil && e.err != nil && p.now().Sub(e.failedAt) >= p.retryAfter {
+	if e != nil && e.err != nil && !p.now().Before(e.retryAt) {
 		e = nil
 	}
 	if e == nil {
@@ -123,7 +124,13 @@ func (p *DCPools) start(dc int, e *dcPool) {
 	}
 	if err != nil {
 		e.err = err
-		e.failedAt = p.now()
+		// A flood wait on the login (auth.exportAuthorization) lasts as long as Telegram says;
+		// asking again sooner only gets the same answer.
+		wait := p.retryAfter
+		if d, ok := tgerr.AsFloodWait(err); ok && d > wait {
+			wait = d
+		}
+		e.retryAt = p.now().Add(wait)
 	} else {
 		e.inv = inv
 		var invoker tg.Invoker = &dcPoolInvoker{next: inv, pools: p, dc: dc, entry: e}

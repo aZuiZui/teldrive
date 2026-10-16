@@ -3,6 +3,7 @@ package tgc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -231,5 +232,26 @@ func TestDCPoolsUnknownDCAndNoConnectionsUseTheFallback(t *testing.T) {
 	}
 	if f.opens.Load() != 0 {
 		t.Fatal("nothing should have been opened")
+	}
+}
+
+func TestDCPoolsWaitOutALoginFloodWait(t *testing.T) {
+	flood := fmt.Errorf("export auth to 1: %w", tgerr.New(420, "FLOOD_WAIT_1705"))
+	f := &fakeOpener{fail: func(int) error { return flood }}
+	p := newDCPools(context.Background(), 4, f.open, tg.NewClient(&fakeInvoker{}))
+	defer p.Close()
+	now := time.Unix(1000, 0)
+	p.now = func() time.Time { return now }
+
+	_, _ = p.API(context.Background(), 1)
+	now = now.Add(10 * time.Minute)
+	_, _ = p.API(context.Background(), 1)
+	if got := f.opens.Load(); got != 1 {
+		t.Fatalf("asked again %d times within the 1705s flood wait", got-1)
+	}
+	now = now.Add(1705*time.Second - 10*time.Minute)
+	_, _ = p.API(context.Background(), 1)
+	if got := f.opens.Load(); got != 2 {
+		t.Fatalf("after the flood wait: %d opens, want 2", got)
 	}
 }
