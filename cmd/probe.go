@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -118,16 +120,19 @@ func runProbeCmd(ctx context.Context, cfg *config.ProbeCmdConfig, ids []string) 
 			fail(fmt.Sprintf("no session for user %d: %v", userID, err))
 			continue
 		}
-		// No retry middleware: the probe makes its own attempts and must see Telegram's answer.
+		// No retry middleware: the probe makes its own attempts and must see Telegram's answer. A
+		// flood wait longer than a few seconds fails at once and says how long, instead of the
+		// probe sitting through it silently.
 		client, err := tgc.AuthClient(ctx, &cfg.TG, session.Session,
-			tgc.NewMiddleware(&cfg.TG, tgc.WithFloodWait(), tgc.WithRateLimit())...)
+			tgc.NewMiddleware(&cfg.TG, tgc.WithFloodWaitLimit(5*time.Second, func(time.Duration) {}), tgc.WithRateLimit())...)
 		if err != nil {
 			fail(fmt.Sprintf("telegram client: %v", err))
 			continue
 		}
 		err = tgc.RunWithAuth(ctx, client, session.Session, func(ctx context.Context) error {
+			dcDown := map[int]string{}
 			for _, f := range files {
-				probeParts(ctx, cfg, client.API(), &f.file, &results[f.index])
+				probeParts(ctx, cfg, client.API(), &f.file, &results[f.index], dcDown)
 			}
 			return nil
 		})
@@ -157,8 +162,10 @@ func loadProbeFile(db *gorm.DB, id string, result *probeFileResult) (models.File
 	return file, true
 }
 
-// probeParts reads the first and last block of every part of file into result.
-func probeParts(ctx context.Context, cfg *config.ProbeCmdConfig, api *tg.Client, file *models.File, result *probeFileResult) {
+// probeParts reads the first and last block of every part of file into result. dcDown holds the
+// DCs this run couldn't log in to (a flood wait, a timeout): their parts aren't asked for again,
+// so one refused login doesn't turn into hundreds.
+func probeParts(ctx context.Context, cfg *config.ProbeCmdConfig, api *tg.Client, file *models.File, result *probeFileResult, dcDown map[int]string) {
 	ids := make([]int, len(*file.Parts))
 	for i, part := range *file.Parts {
 		ids[i] = part.ID
@@ -177,6 +184,11 @@ func probeParts(ctx context.Context, cfg *config.ProbeCmdConfig, api *tg.Client,
 			continue
 		}
 		part.Size = document.Size
+		if reason, down := dcDown[document.DCID]; down {
+			part.Error = fmt.Sprintf("not checked: no login to DC %d (%s)", document.DCID, reason)
+			result.Parts = append(result.Parts, part)
+			continue
+		}
 		began := time.Now()
 		fetch := func(ctx context.Context, offset int64) error {
 			_, err := tgc.GetChunk(ctx, api, document.AsInputDocumentFileLocation(), offset, probeBlock)
@@ -184,6 +196,9 @@ func probeParts(ctx context.Context, cfg *config.ProbeCmdConfig, api *tg.Client,
 		}
 		if err := probeSpots(ctx, fetch, document.Size, cfg.Timeout, cfg.Attempts); err != nil {
 			part.Error = err.Error()
+			if strings.Contains(part.Error, "create connection to DC") {
+				dcDown[document.DCID] = loginFailure(part.Error)
+			}
 		} else {
 			part.OK = true
 		}
@@ -195,6 +210,22 @@ func probeParts(ctx context.Context, cfg *config.ProbeCmdConfig, api *tg.Client,
 		result.OK = result.OK && part.OK
 	}
 }
+
+// loginFailure is the short reason a DC login failed: Telegram's flood wait, or the timeout.
+func loginFailure(err string) string {
+	for _, re := range floodWaitREs {
+		if m := re.FindString(err); m != "" {
+			return m
+		}
+	}
+	if strings.Contains(err, "deadline exceeded") {
+		return "timed out"
+	}
+	return "login failed"
+}
+
+// Telegram's own FLOOD_WAIT (n) first; the middleware's wording when that isn't in the error.
+var floodWaitREs = []*regexp.Regexp{regexp.MustCompile(`FLOOD_WAIT \(\d+\)`), regexp.MustCompile(`flood wait argument is too big \([^)]*\)`)}
 
 func partDocument(messages []tg.MessageClass, id int) *tg.Document {
 	for _, message := range messages {
