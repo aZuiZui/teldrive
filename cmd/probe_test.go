@@ -48,3 +48,16 @@ func TestProbeSpotsFailsWhenEveryAttemptFails(t *testing.T) {
 		t.Fatalf("calls = %d, err = %v", calls, err)
 	}
 }
+
+func TestLoginFailureNamesTheFloodWait(t *testing.T) {
+	cases := map[string]string{
+		"offset 0: create connection to DC 1: transfer: export auth to 1: flood wait argument is too big (28m25s > 5s): retry middleware skip: rpc error code 420: FLOOD_WAIT (1705)": "FLOOD_WAIT (1705)",
+		"offset 0: create connection to DC 1: transfer: onTransfer: export to 1: export auth to 1: context deadline exceeded":                                                         "timed out",
+		"offset 0: create connection to DC 5: dial: refused": "login failed",
+	}
+	for err, want := range cases {
+		if got := loginFailure(err); got != want {
+			t.Errorf("loginFailure(%q) = %q, want %q", err, got, want)
+		}
+	}
+}

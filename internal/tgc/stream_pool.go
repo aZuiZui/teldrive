@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/tg"
 )
 
 // ErrStreamPoolClosed is returned by Acquire after Close.
@@ -14,7 +15,21 @@ var ErrStreamPoolClosed = errors.New("stream client pool is closed")
 
 // StreamClientRunner runs one bot's client until ctx ends: it connects, logs the bot in, calls
 // ready once the client can be used, then keeps it running. It returns when the client stops.
-type StreamClientRunner func(ctx context.Context, token string, ready func(*telegram.Client)) error
+type StreamClientRunner func(ctx context.Context, token string, ready func(*WarmClient)) error
+
+// WarmClient is a bot's running client and its connections to the DCs that hold files.
+type WarmClient struct {
+	*telegram.Client
+	DCs *DCPools // nil: every read goes through the client's API
+}
+
+// DCAPI returns the client to read a file stored on dc with.
+func (c *WarmClient) DCAPI(ctx context.Context, dc int) (*tg.Client, error) {
+	if c.DCs == nil {
+		return c.API(), nil
+	}
+	return c.DCs.API(ctx, dc)
+}
 
 // StreamPool keeps one running client per streaming bot, shared by every stream request,
 // instead of a new client per request. A new client has to log in to the DC that holds the file
@@ -41,7 +56,7 @@ type pooledClient struct {
 	cancel   context.CancelFunc
 	ready    chan struct{} // closed once client or err is set
 	done     chan struct{} // closed when the client has stopped
-	client   *telegram.Client
+	client   *WarmClient
 	err      error
 	refs     int
 	lastUsed time.Time
@@ -60,7 +75,7 @@ func NewStreamPool(run StreamClientRunner, idle time.Duration) *StreamPool {
 // Acquire returns the running client of the bot with this token, starting it if needed, and a
 // release func to call when the request is done with it. It waits for the client to be ready
 // (or ctx to end). The client is shared: use it, don't Run or stop it.
-func (p *StreamPool) Acquire(ctx context.Context, token string) (*telegram.Client, func(), error) {
+func (p *StreamPool) Acquire(ctx context.Context, token string) (*WarmClient, func(), error) {
 	pc, err := p.lease(token)
 	if err != nil {
 		return nil, nil, err
@@ -106,7 +121,7 @@ func (p *StreamPool) lease(token string) (*pooledClient, error) {
 
 func (p *StreamPool) start(ctx context.Context, pc *pooledClient) {
 	readyOnce := sync.Once{}
-	err := p.run(ctx, pc.token, func(c *telegram.Client) {
+	err := p.run(ctx, pc.token, func(c *WarmClient) {
 		p.mu.Lock()
 		pc.client = c
 		p.mu.Unlock()

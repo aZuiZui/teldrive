@@ -220,8 +220,12 @@ func NewApiService(db *gorm.DB,
 // runStreamClient runs one bot's warm streaming client for the pool: logged in once, then kept
 // connected (with its DC connections) until the pool closes it. ctx is the pool's, not a
 // request's, so the middlewares (recovery, flood-wait standby) outlive every request.
-func (a *apiService) runStreamClient(ctx context.Context, token string, ready func(*telegram.Client)) error {
-	client, err := tgc.BotClient(ctx, a.db, a.cache, &a.cnf.TG, token, a.streamMiddlewares(ctx, token, int(a.streamBots.Load()))...)
+//
+// The client's DC pools share its middlewares (the same instances), so the bot's rate limit and
+// flood-wait standby cover the reads on every connection.
+func (a *apiService) runStreamClient(ctx context.Context, token string, ready func(*tgc.WarmClient)) error {
+	middlewares := a.streamMiddlewares(ctx, token, int(a.streamBots.Load()))
+	client, err := tgc.BotClient(ctx, a.db, a.cache, &a.cnf.TG, token, middlewares...)
 	if err != nil {
 		return err
 	}
@@ -229,7 +233,12 @@ func (a *apiService) runStreamClient(ctx context.Context, token string, ready fu
 		if err := tgc.Auth(ctx, client, token); err != nil {
 			return err
 		}
-		ready(client)
+		sc := &tgc.WarmClient{Client: client}
+		if n := a.cnf.TG.Stream.WarmConnections; n > 0 {
+			sc.DCs = tgc.NewDCPools(ctx, client, n, middlewares...)
+			defer sc.DCs.Close()
+		}
+		ready(sc)
 		<-ctx.Done()
 		return ctx.Err()
 	})

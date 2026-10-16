@@ -18,14 +18,14 @@ type fakeRunner struct {
 	fail   func(n int32) error
 }
 
-func (f *fakeRunner) run(ctx context.Context, token string, ready func(*telegram.Client)) error {
+func (f *fakeRunner) run(ctx context.Context, token string, ready func(*WarmClient)) error {
 	n := f.starts.Add(1)
 	if f.fail != nil {
 		if err := f.fail(n); err != nil {
 			return err
 		}
 	}
-	ready(&telegram.Client{})
+	ready(&WarmClient{Client: &telegram.Client{}})
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -36,7 +36,7 @@ func TestStreamPoolReusesTheBotsClient(t *testing.T) {
 	defer p.Close(context.Background())
 
 	var wg sync.WaitGroup
-	clients := make([]*telegram.Client, 20)
+	clients := make([]*WarmClient, 20)
 	for i := range clients {
 		wg.Add(1)
 		go func(i int) {
@@ -131,7 +131,7 @@ func TestStreamPoolRestartsAStoppedClient(t *testing.T) {
 }
 
 func TestStreamPoolAcquireStopsWithTheRequest(t *testing.T) {
-	slow := func(ctx context.Context, token string, ready func(*telegram.Client)) error {
+	slow := func(ctx context.Context, token string, ready func(*WarmClient)) error {
 		<-ctx.Done() // never ready
 		return ctx.Err()
 	}
