@@ -174,7 +174,7 @@ func (f floodWaitReporter) Handle(next tg.Invoker) telegram.InvokeFunc {
 func WithRecovery(ctx context.Context) middlewareOption {
 	return func(mc *middlewareConfig) {
 		mc.middlewares = append(mc.middlewares,
-			recovery.New(ctx, newBackoff(mc.config.ReconnectTimeout)))
+			recovery.New(ctx, func() backoff.BackOff { return newBackoff(mc.config.ReconnectTimeout) }))
 	}
 }
 

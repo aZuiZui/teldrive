@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"reflect"
 	"regexp"
@@ -102,6 +103,23 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 	if port != conf.Server.Port {
 		lg.Info("server.port_occupied", zap.Int("occupied_port", conf.Server.Port), zap.Int("new_port", port))
 		conf.Server.Port = port
+	}
+
+	// server.enable-pprof: Go's profiler on its own port (6060, not the API's), for finding memory
+	// and goroutine leaks; publish nothing for it: reach it on the container's own address.
+	if conf.Server.EnablePprof {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			lg.Info("pprof.listening", zap.String("addr", ":6060"))
+			if err := http.ListenAndServe(":6060", mux); err != nil {
+				lg.Error("pprof.failed", zap.Error(err))
+			}
+		}()
 	}
 
 	// Channel for background service initialization errors
