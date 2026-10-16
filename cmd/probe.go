@@ -73,27 +73,77 @@ Examples:
 	return cmd
 }
 
+// runProbeCmd probes the files in order, with one Telegram client per owner for all of them: a
+// client logs in to each DC that holds parts once (auth.exportAuthorization), not once per file,
+// which would get the account flood-waited when hundreds of files are checked at once.
 func runProbeCmd(ctx context.Context, cfg *config.ProbeCmdConfig, ids []string) []probeFileResult {
-	results := make([]probeFileResult, 0, len(ids))
+	results := make([]probeFileResult, len(ids))
 	db, err := database.NewDatabase(ctx, &cfg.DB, &config.DBLoggingConfig{Level: "fatal"}, zap.NewNop())
 	if err != nil {
-		for _, id := range ids {
-			results = append(results, probeFileResult{ID: id, Error: fmt.Sprintf("database: %v", err)})
+		for i, id := range ids {
+			results[i] = probeFileResult{ID: id, Error: fmt.Sprintf("database: %v", err), Parts: []probePartResult{}}
 		}
 		return results
 	}
-	for _, id := range ids {
-		results = append(results, probeFile(ctx, cfg, db, id))
+
+	type pending struct {
+		index int
+		file  models.File
+	}
+	byUser := map[int64][]pending{}
+	var users []int64
+	for i, id := range ids {
+		results[i] = probeFileResult{ID: id, Parts: []probePartResult{}}
+		file, ok := loadProbeFile(db, id, &results[i])
+		if !ok {
+			continue
+		}
+		if _, seen := byUser[file.UserId]; !seen {
+			users = append(users, file.UserId)
+		}
+		byUser[file.UserId] = append(byUser[file.UserId], pending{i, file})
+	}
+
+	for _, userID := range users {
+		files := byUser[userID]
+		fail := func(msg string) {
+			for _, f := range files {
+				if results[f.index].Error == "" && len(results[f.index].Parts) == 0 {
+					results[f.index].Error = msg
+				}
+			}
+		}
+		var session models.Session
+		if err := db.Where("user_id = ?", userID).Order("created_at desc").First(&session).Error; err != nil {
+			fail(fmt.Sprintf("no session for user %d: %v", userID, err))
+			continue
+		}
+		// No retry middleware: the probe makes its own attempts and must see Telegram's answer.
+		client, err := tgc.AuthClient(ctx, &cfg.TG, session.Session,
+			tgc.NewMiddleware(&cfg.TG, tgc.WithFloodWait(), tgc.WithRateLimit())...)
+		if err != nil {
+			fail(fmt.Sprintf("telegram client: %v", err))
+			continue
+		}
+		err = tgc.RunWithAuth(ctx, client, session.Session, func(ctx context.Context) error {
+			for _, f := range files {
+				probeParts(ctx, cfg, client.API(), &f.file, &results[f.index])
+			}
+			return nil
+		})
+		if err != nil {
+			fail(err.Error())
+		}
 	}
 	return results
 }
 
-func probeFile(ctx context.Context, cfg *config.ProbeCmdConfig, db *gorm.DB, id string) probeFileResult {
-	result := probeFileResult{ID: id, Parts: []probePartResult{}}
+// loadProbeFile reads the file's row; false (with result.Error set) when there is nothing to probe.
+func loadProbeFile(db *gorm.DB, id string, result *probeFileResult) (models.File, bool) {
 	var file models.File
 	if err := db.Where("id = ?", id).First(&file).Error; err != nil {
 		result.Error = fmt.Sprintf("file: %v", err)
-		return result
+		return file, false
 	}
 	result.Name, result.Status = file.Name, file.Status
 	if file.Size != nil {
@@ -101,65 +151,49 @@ func probeFile(ctx context.Context, cfg *config.ProbeCmdConfig, db *gorm.DB, id 
 	}
 	if file.ChannelId == nil || file.Parts == nil || len(*file.Parts) == 0 {
 		result.Error = "file has no Telegram parts"
-		return result
+		return file, false
 	}
 	result.ChannelID = *file.ChannelId
+	return file, true
+}
 
-	var session models.Session
-	if err := db.Where("user_id = ?", file.UserId).Order("created_at desc").First(&session).Error; err != nil {
-		result.Error = fmt.Sprintf("no session for user %d: %v", file.UserId, err)
-		return result
-	}
-	// No retry middleware: the probe makes its own attempts and must see Telegram's answer.
-	client, err := tgc.AuthClient(ctx, &cfg.TG, session.Session,
-		tgc.NewMiddleware(&cfg.TG, tgc.WithFloodWait(), tgc.WithRateLimit())...)
-	if err != nil {
-		result.Error = fmt.Sprintf("telegram client: %v", err)
-		return result
-	}
-
+// probeParts reads the first and last block of every part of file into result.
+func probeParts(ctx context.Context, cfg *config.ProbeCmdConfig, api *tg.Client, file *models.File, result *probeFileResult) {
 	ids := make([]int, len(*file.Parts))
 	for i, part := range *file.Parts {
 		ids[i] = part.ID
 	}
-	err = tgc.RunWithAuth(ctx, client, session.Session, func(ctx context.Context) error {
-		messages, err := tgc.GetMessages(ctx, client.API(), ids, *file.ChannelId)
-		if err != nil {
-			return fmt.Errorf("get messages: %w", err)
-		}
-		for i, id := range ids {
-			part := probePartResult{Part: i + 1, MessageID: id}
-			document := partDocument(messages, id)
-			if document == nil {
-				part.Error = "message or document not found"
-				result.Parts = append(result.Parts, part)
-				continue
-			}
-			part.Size = document.Size
-			began := time.Now()
-			fetch := func(ctx context.Context, offset int64) error {
-				_, err := tgc.GetChunk(ctx, client.API(), document.AsInputDocumentFileLocation(), offset, probeBlock)
-				return err
-			}
-			if err := probeSpots(ctx, fetch, document.Size, cfg.Timeout, cfg.Attempts); err != nil {
-				part.Error = err.Error()
-			} else {
-				part.OK = true
-			}
-			part.Millis = time.Since(began).Milliseconds()
-			result.Parts = append(result.Parts, part)
-		}
-		return nil
-	})
+	messages, err := tgc.GetMessages(ctx, api, ids, *file.ChannelId)
 	if err != nil {
-		result.Error = err.Error()
-		return result
+		result.Error = fmt.Errorf("get messages: %w", err).Error()
+		return
+	}
+	for i, id := range ids {
+		part := probePartResult{Part: i + 1, MessageID: id}
+		document := partDocument(messages, id)
+		if document == nil {
+			part.Error = "message or document not found"
+			result.Parts = append(result.Parts, part)
+			continue
+		}
+		part.Size = document.Size
+		began := time.Now()
+		fetch := func(ctx context.Context, offset int64) error {
+			_, err := tgc.GetChunk(ctx, api, document.AsInputDocumentFileLocation(), offset, probeBlock)
+			return err
+		}
+		if err := probeSpots(ctx, fetch, document.Size, cfg.Timeout, cfg.Attempts); err != nil {
+			part.Error = err.Error()
+		} else {
+			part.OK = true
+		}
+		part.Millis = time.Since(began).Milliseconds()
+		result.Parts = append(result.Parts, part)
 	}
 	result.OK = len(result.Parts) == len(ids)
 	for _, part := range result.Parts {
 		result.OK = result.OK && part.OK
 	}
-	return result
 }
 
 func partDocument(messages []tg.MessageClass, id int) *tg.Document {
