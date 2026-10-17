@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"reflect"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/spf13/cobra"
+	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/config"
 	"github.com/tgdrive/teldrive/internal/database"
 	"github.com/tgdrive/teldrive/internal/tgc"
@@ -75,9 +78,9 @@ Examples:
 	return cmd
 }
 
-// runProbeCmd probes the files in order, with one Telegram client per owner for all of them: a
-// client logs in to each DC that holds parts once (auth.exportAuthorization), not once per file,
-// which would get the account flood-waited when hundreds of files are checked at once.
+// runProbeCmd probes the files in order with the owner's bots (see probeOwner): each client logs
+// in to each DC that holds parts once (auth.exportAuthorization), not once per file, and the
+// owner's own account isn't used while there are bots (checking per file got it flood-waited).
 func runProbeCmd(ctx context.Context, cfg *config.ProbeCmdConfig, ids []string) []probeFileResult {
 	results := make([]probeFileResult, len(ids))
 	db, err := database.NewDatabase(ctx, &cfg.DB, &config.DBLoggingConfig{Level: "fatal"}, zap.NewNop())
@@ -88,11 +91,7 @@ func runProbeCmd(ctx context.Context, cfg *config.ProbeCmdConfig, ids []string) 
 		return results
 	}
 
-	type pending struct {
-		index int
-		file  models.File
-	}
-	byUser := map[int64][]pending{}
+	byUser := map[int64][]probePending{}
 	var users []int64
 	for i, id := range ids {
 		results[i] = probeFileResult{ID: id, Parts: []probePartResult{}}
@@ -103,44 +102,118 @@ func runProbeCmd(ctx context.Context, cfg *config.ProbeCmdConfig, ids []string) 
 		if _, seen := byUser[file.UserId]; !seen {
 			users = append(users, file.UserId)
 		}
-		byUser[file.UserId] = append(byUser[file.UserId], pending{i, file})
+		byUser[file.UserId] = append(byUser[file.UserId], probePending{i, file})
 	}
 
+	memCache := cache.NewMemoryCache(10 << 20)
 	for _, userID := range users {
-		files := byUser[userID]
-		fail := func(msg string) {
-			for _, f := range files {
-				if results[f.index].Error == "" && len(results[f.index].Parts) == 0 {
-					results[f.index].Error = msg
-				}
+		probeOwner(ctx, cfg, db, memCache, userID, byUser[userID], results)
+	}
+	return results
+}
+
+type probePending struct {
+	index int
+	file  models.File
+}
+
+// probeAccount is what the probe reads with: one of the owner's bots, or (no bots) their own session.
+type probeAccount struct {
+	label string
+	token string // bot token; "" for the user's session
+}
+
+// probeOwner probes one owner's files with their bots, in turn from a random one: a bot that gets
+// a flood wait hands the file it was on, and the rest, to the next bot (as streaming puts a
+// flood-waited bot on standby). Only when every bot has been tried does a file report the flood
+// wait. Without bots it uses the owner's session (which then takes every login and flood wait).
+func probeOwner(ctx context.Context, cfg *config.ProbeCmdConfig, db *gorm.DB, c cache.Cacher, userID int64,
+	files []probePending, results []probeFileResult) {
+	fail := func(queue []probePending, msg string) {
+		for _, f := range queue {
+			if results[f.index].Error == "" && len(results[f.index].Parts) == 0 {
+				results[f.index].Error = msg
 			}
 		}
-		var session models.Session
+	}
+	var accounts []probeAccount
+	var bots []models.Bot
+	db.Where("user_id = ?", userID).Order("bot_id").Find(&bots)
+	for _, bot := range bots {
+		accounts = append(accounts, probeAccount{label: fmt.Sprintf("bot %d", bot.BotId), token: bot.Token})
+	}
+	var session models.Session
+	if len(accounts) == 0 {
 		if err := db.Where("user_id = ?", userID).Order("created_at desc").First(&session).Error; err != nil {
-			fail(fmt.Sprintf("no session for user %d: %v", userID, err))
-			continue
+			fail(files, fmt.Sprintf("no bots and no session for user %d: %v", userID, err))
+			return
 		}
+		accounts = append(accounts, probeAccount{label: "user session"})
+	}
+
+	base := make(map[int]probeFileResult, len(files))
+	for _, f := range files {
+		base[f.index] = results[f.index]
+	}
+	queue := files
+	start := rand.Intn(len(accounts))
+	for tried := 0; len(queue) > 0 && tried < len(accounts); tried++ {
+		acct := accounts[(start+tried)%len(accounts)]
 		// No retry middleware: the probe makes its own attempts and must see Telegram's answer. A
-		// flood wait longer than a few seconds fails at once and says how long, instead of the
-		// probe sitting through it silently.
-		client, err := tgc.AuthClient(ctx, &cfg.TG, session.Session,
-			tgc.NewMiddleware(&cfg.TG, tgc.WithFloodWaitLimit(5*time.Second, func(time.Duration) {}), tgc.WithRateLimit())...)
+		// flood wait longer than a few seconds fails at once, and the next account takes over.
+		mw := tgc.NewMiddleware(&cfg.TG, tgc.WithFloodWaitLimit(5*time.Second, func(time.Duration) {}), tgc.WithRateLimit())
+		var (
+			client *telegram.Client
+			err    error
+			auth   = acct.token
+		)
+		if acct.token != "" {
+			client, err = tgc.BotClient(ctx, db, c, &cfg.TG, acct.token, mw...)
+		} else {
+			client, err = tgc.AuthClient(ctx, &cfg.TG, session.Session, mw...)
+			auth = session.Session
+		}
 		if err != nil {
-			fail(fmt.Sprintf("telegram client: %v", err))
+			fail(queue, fmt.Sprintf("telegram client (%s): %v", acct.label, err))
 			continue
 		}
-		err = tgc.RunWithAuth(ctx, client, session.Session, func(ctx context.Context) error {
+		done := 0
+		err = tgc.RunWithAuth(ctx, client, auth, func(ctx context.Context) error {
 			dcDown := map[int]string{}
-			for _, f := range files {
-				probeParts(ctx, cfg, client.API(), &f.file, &results[f.index], dcDown)
+			for _, f := range queue {
+				res := base[f.index]
+				res.Parts = []probePartResult{}
+				probeParts(ctx, cfg, client.API(), &f.file, &res, dcDown)
+				results[f.index] = res
+				if floodWaited(res) {
+					return nil // this account is flood-waited: the next one takes this file and the rest
+				}
+				done++
 			}
 			return nil
 		})
-		if err != nil {
-			fail(err.Error())
+		if err != nil && done < len(queue) && results[queue[done].index].Error == "" {
+			results[queue[done].index].Error = fmt.Sprintf("%s: %v", acct.label, err)
+		}
+		queue = queue[done:]
+	}
+}
+
+// floodWaited: Telegram made this account wait (a read, or a DC login), so another may get through.
+func floodWaited(r probeFileResult) bool {
+	if isFlood(r.Error) {
+		return true
+	}
+	for _, p := range r.Parts {
+		if !p.OK && isFlood(p.Error) {
+			return true
 		}
 	}
-	return results
+	return false
+}
+
+func isFlood(err string) bool {
+	return strings.Contains(err, "FLOOD_WAIT") || strings.Contains(err, "flood wait")
 }
 
 // loadProbeFile reads the file's row; false (with result.Error set) when there is nothing to probe.
