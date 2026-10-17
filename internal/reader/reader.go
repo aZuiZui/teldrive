@@ -179,6 +179,9 @@ func (r *Reader) getPartReader() (io.ReadCloser, error) {
 		cache:       r.cache,
 		key:         cache.KeyFileLocation(r.config.SessionInstance, r.botID, r.file.ID, partId),
 		refusedTTL:  r.config.Stream.RefusedPartTTL,
+		refusedMin:  r.config.Stream.RefusedPartFirst,
+		info: partInfo{fileID: r.file.ID, fileName: r.file.Name, part: int(currentRange.PartNo) + 1,
+			messageID: partId, channelID: *r.file.ChannelId},
 	}
 
 	var (
