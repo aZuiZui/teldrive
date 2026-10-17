@@ -279,6 +279,10 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 		return nil
 	})
 
+	if err == nil && out.PartId == 0 {
+		// Never answer 200 for a part that isn't in the channel: the file would be made without it.
+		err = ErrUploadFailed
+	}
 	if err != nil {
 		a.standbyDeadBot(ctx, tgc.BotOpUpload, token, err)
 		logger.Error("upload.failed", zap.String("file_name", params.FileName),
