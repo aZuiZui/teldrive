@@ -10,12 +10,38 @@ import (
 )
 
 func RunWithAuth(ctx context.Context, client *telegram.Client, token string, f func(ctx context.Context) error) error {
-	return client.Run(ctx, func(ctx context.Context) error {
+	return runChecked(ctx, client.Run, func(ctx context.Context) error {
 		if err := Auth(ctx, client, token); err != nil {
 			return err
 		}
 		return f(ctx)
 	})
+}
+
+// ErrRunStopped: the client stopped before the callback finished, with no error of its own.
+var ErrRunStopped = errors.New("telegram client stopped before the request finished")
+
+// runChecked runs f with run (telegram.Client.Run) and returns nil only when f itself returned
+// nil. Client.Run returns nil for any error that wraps context.Canceled, including one from the
+// callback: a part upload whose connection was cancelled half way "succeeded" with no message,
+// so teldrive answered 200 with an empty part and the file was created without it.
+func runChecked(ctx context.Context, run func(context.Context, func(context.Context) error) error, f func(context.Context) error) error {
+	var (
+		fErr     error
+		finished bool
+	)
+	err := run(ctx, func(ctx context.Context) error {
+		fErr = f(ctx)
+		finished = fErr == nil
+		return fErr
+	})
+	if err != nil || finished {
+		return err
+	}
+	if fErr != nil {
+		return fErr
+	}
+	return ErrRunStopped
 }
 
 func Auth(ctx context.Context, client *telegram.Client, token string) error {
