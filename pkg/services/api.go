@@ -258,6 +258,10 @@ type extendedMiddleware struct {
 }
 
 func (m *extendedMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == RefusedPath && r.Method == http.MethodGet {
+		serveRefused(w, r)
+		return
+	}
 	route, ok := m.next.FindRoute(r.Method, r.URL.Path)
 	if !ok {
 		m.next.ServeHTTP(w, r)

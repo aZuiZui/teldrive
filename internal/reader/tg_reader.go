@@ -39,7 +39,9 @@ type chunkSource struct {
 	dcAPI       DCAPI // set for a warm client: reads go to the part's DC over several connections
 	key         string
 	cache       cache.Cacher
-	refusedTTL  time.Duration // how long a part Telegram refused fails at once (0: never)
+	refusedTTL  time.Duration // the longest a part Telegram refused fails at once (0: never)
+	refusedMin  time.Duration // ...after its first refusal (doubled for each one after)
+	info        partInfo      // which part, for `teldrive refused`
 }
 
 func (c *chunkSource) ChunkSize(start, end int64) int64 {
@@ -53,7 +55,7 @@ func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]b
 	}
 	chunk, err := c.fetch(ctx, offset, limit)
 	if err != nil {
-		refused.remember(refusedAt, err, c.refusedTTL)
+		refused.remember(refusedAt, c.info, err, c.refusedMin, c.refusedTTL)
 		return nil, err
 	}
 	refused.forget(refusedAt)
