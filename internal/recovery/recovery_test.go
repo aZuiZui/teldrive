@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -55,18 +56,20 @@ func TestRecoveryStopsWhenTheCallsContextEnds(t *testing.T) {
 	}
 }
 
-func TestRecoveryDoesntRetryACancelledCall(t *testing.T) {
+// A dropped connection fails a call that is still wanted with an error wrapping context.Canceled:
+// it is retried; only the call's (or the middleware's) own context ending stops it.
+func TestRecoveryRetriesADroppedConnection(t *testing.T) {
 	mw := New(context.Background(), fastBackoff)
 	var calls atomic.Int32
+	dropped := fmt.Errorf("rpcDoRequest: retryUntilAck: engine forcibly closed: %w", context.Canceled)
 	h := mw.Handle(invokerFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
-		calls.Add(1)
-		return context.Canceled
+		if calls.Add(1) < 3 {
+			return dropped
+		}
+		return nil
 	}))
-	if err := h(context.Background(), nil, nil); !errors.Is(err, context.Canceled) {
-		t.Fatalf("got %v, want context.Canceled", err)
-	}
-	if calls.Load() != 1 {
-		t.Fatalf("a cancelled call was tried %d times, want 1", calls.Load())
+	if err := h(context.Background(), nil, nil); err != nil || calls.Load() != 3 {
+		t.Fatalf("err %v after %d calls, want success after 3", err, calls.Load())
 	}
 }
 

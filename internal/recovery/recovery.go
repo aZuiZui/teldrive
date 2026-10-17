@@ -50,10 +50,10 @@ func (r *recovery) Handle(next tg.Invoker) telegram.InvokeFunc {
 }
 
 func (r *recovery) shouldRecover(ctx context.Context, err error) bool {
+	// Only the contexts decide: an error that merely wraps context.Canceled while the call is
+	// still wanted is a dropped connection ("engine forcibly closed: context canceled"), and must
+	// be retried like any other. Refusing those (nasfix5) left upload parts cut off half way.
 	if ctx.Err() != nil || r.ctx.Err() != nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 
