@@ -61,3 +61,18 @@ func TestLoginFailureNamesTheFloodWait(t *testing.T) {
 		}
 	}
 }
+
+func TestFloodWaitedMovesToTheNextAccount(t *testing.T) {
+	flood := probeFileResult{Parts: []probePartResult{{OK: true}, {Error: "offset 0: flood wait argument is too big (9s > 5s): rpc error code 420: FLOOD_WAIT (9)"}}}
+	login := probeFileResult{Parts: []probePartResult{{Error: "not checked: no login to DC 1 (FLOOD_WAIT (1639))"}}}
+	refused := probeFileResult{Parts: []probePartResult{{Error: "offset 0: rpc error code -503: Timeout"}}}
+	fine := probeFileResult{OK: true, Parts: []probePartResult{{OK: true}}}
+	for name, c := range map[string]struct {
+		r    probeFileResult
+		want bool
+	}{"read flood wait": {flood, true}, "DC login flood wait": {login, true}, "-503": {refused, false}, "readable": {fine, false}} {
+		if got := floodWaited(c.r); got != c.want {
+			t.Errorf("%s: floodWaited = %v, want %v", name, got, c.want)
+		}
+	}
+}
