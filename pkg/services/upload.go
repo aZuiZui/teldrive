@@ -280,6 +280,7 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 	})
 
 	if err != nil {
+		a.standbyDeadBot(ctx, tgc.BotOpUpload, token, err)
 		logger.Error("upload.failed", zap.String("file_name", params.FileName),
 			zap.String("part_name", params.PartName),
 			zap.Int("part_no", params.PartNo), zap.Error(err))

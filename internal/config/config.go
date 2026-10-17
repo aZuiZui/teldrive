@@ -80,6 +80,12 @@ type ProbeCmdConfig struct {
 	Attempts int           `default:"3" description:"Reads at each spot before a part counts as unreadable"`
 }
 
+type BotsCmdConfig struct {
+	Log LoggingConfig `skipPflag:"true"`
+	DB  DBConfig      `skipPflag:"true"`
+	TG  TGConfig      `skipPflag:"true"`
+}
+
 type ServerConfig struct {
 	Port             int           `default:"8080" description:"HTTP port for the server to listen on"`
 	GracefulShutdown time.Duration `default:"10s" description:"Grace period for server shutdown"`

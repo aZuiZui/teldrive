@@ -970,6 +970,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			var warm *tgc.WarmClient
 			warm, release, err = e.api.streamPool.Acquire(ctx, token)
 			if err != nil {
+				e.api.standbyDeadBot(ctx, tgc.BotOpStream, token, err)
 				fail("stream.bot_client_failed", http.StatusBadGateway, err)
 				return
 			}
@@ -1035,11 +1036,13 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 
 	if release != nil {
 		if err := handleStream(ctx); err != nil {
+			e.api.standbyDeadBot(ctx, tgc.BotOpStream, token, err)
 			fail("stream.client_failed", http.StatusBadGateway, err)
 		}
 		return
 	}
 	if err := tgc.RunWithAuth(ctx, client, token, handleStream); err != nil {
+		e.api.standbyDeadBot(ctx, tgc.BotOpStream, token, err)
 		fail("stream.client_failed", http.StatusBadGateway, err)
 	}
 }

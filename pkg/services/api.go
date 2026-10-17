@@ -72,6 +72,24 @@ func (a *apiService) streamMiddlewares(ctx context.Context, token string, bots i
 	)
 }
 
+// deadBotStandby: how long a bot whose token Telegram refused is kept out of the rotation. Only a
+// pause (the error may be passing): the hub's bot check removes a bot for good, after a fresh
+// login confirms the token is dead (`teldrive bots`).
+const deadBotStandby = time.Hour
+
+// standbyDeadBot puts the bot on standby for op when err says Telegram refused its token.
+func (a *apiService) standbyDeadBot(ctx context.Context, op tgc.BotOp, token string, err error) {
+	if token == "" || !tgc.IsDeadBotError(err) {
+		return
+	}
+	logger := logging.FromContext(ctx).With(zap.String("bot_id", strings.Split(token, ":")[0]), zap.String("op", string(op)))
+	if serr := a.botSelector.Standby(context.WithoutCancel(ctx), op, token, deadBotStandby); serr != nil {
+		logger.Error("bot.dead_standby_failed", zap.Error(serr))
+		return
+	}
+	logger.Warn("bot.dead", zap.Duration("standby", deadBotStandby), zap.Error(err))
+}
+
 func (a *apiService) VersionVersion(ctx context.Context) (*api.ApiVersion, error) {
 	return version.GetVersionInfo(), nil
 }
